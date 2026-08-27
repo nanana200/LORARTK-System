@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# RTCM captures and runtime output
+captures/
+*.rtcm
+*.rtcm3
+*.log
+
+# STM32CubeIDE build output
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~
