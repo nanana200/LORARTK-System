@@ -38,7 +38,7 @@ print(f"✅ 작업 폴더 설정 완료: {os.getcwd()}")
 # =================================================================
 CONFIG = {
     # 1. 지도 설정``
-    "API_KEY": os.getenv("VWORLD_API_KEY", ""),  # V-WORLD API 키는 환경변수로 지정
+    "API_KEY": "FB928738-CF29-39F6-98F4-85D5D7A93B75",  # V-WORLD API 키
     "HOME_LAT": 37.32066,       # [수정가능] 본부(HQ) 위도
     "HOME_LON": 127.12631,      # [수정가능] 본부(HQ) 경도
     
@@ -649,6 +649,9 @@ class FinalGCS(ctk.CTk):
 
                 self.log_gps(lat, lon)
                 self.update_drone_marker(lat, lon)
+                self.log_system(
+                    f"[GUI] position updated: lat={lat:.7f}, lon={lon:.7f}"
+                )
 
                 # 사람이 새로 검출된 이벤트면 현재 드론 GPS 위치에 초록색 마커 표시
                 # 드론 쪽에서 중복 방지 처리해서 detected=1은 이벤트성으로만 들어오는 구조

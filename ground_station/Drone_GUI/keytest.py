@@ -115,13 +115,13 @@ _ntrip_socket: Optional[socket.socket] = None
 _ntrip_socket_lock = threading.Lock()
 
 _latest_rtcm_frames: dict[int, LatestRtcmFrame] = {}
-_rtcm_round_robin_index = 0
 _rtcm_generation = 0
 _rtcm_replaced_frames = 0
 _pending_waypoint: Optional[WaypointCommand] = None
 _awaiting_waypoint_ack: dict[int, WaypointCommand] = {}
 _next_waypoint_id = 1
 _cycle_count = 0
+_awaiting_downlink_end: Optional[tuple[int, str]] = None
 
 _link_events: deque[str] = deque(maxlen=200)
 
@@ -520,44 +520,41 @@ def acknowledge_waypoint(command_id: int) -> bool:
         return _awaiting_waypoint_ack.pop(command_id, None) is not None
 
 
-def _take_cycle_inputs() -> tuple[Optional[LatestRtcmFrame], Optional[WaypointCommand]]:
-    """허용 타입을 순환 선택하되 신선한 최신 프레임 하나만 꺼낸다."""
+def _take_cycle_inputs() -> tuple[
+    list[LatestRtcmFrame],
+    Optional[WaypointCommand],
+    tuple[int, ...],
+    tuple[int, ...],
+]:
+    """타입별 최신 RTCM을 한꺼번에 꺼내고 stale/missing 타입을 함께 반환한다."""
 
-    global _rtcm_round_robin_index, _pending_waypoint
+    global _pending_waypoint
 
-    selected: Optional[LatestRtcmFrame] = None
-    stale_frames: list[LatestRtcmFrame] = []
+    selected: list[LatestRtcmFrame] = []
+    stale_types: list[int] = []
+    missing_types: list[int] = []
     now = time.monotonic()
 
     with _state_lock:
         waypoint = _pending_waypoint
         _pending_waypoint = None
 
-        # 한 cycle에는 정확히 한 프레임만 꺼낸다. 선택되지 않은 타입도 프레임을
-        # 누적하지 않고 그 타입의 최신값 하나만 유지하므로 snapshot 묶음이 아니다.
-        for offset in range(len(RTCM_PASS_ORDER)):
-            order_index = (_rtcm_round_robin_index + offset) % len(RTCM_PASS_ORDER)
-            message_type = RTCM_PASS_ORDER[order_index]
-            candidate = _latest_rtcm_frames.get(message_type)
+        # 각 타입 슬롯에는 최신 프레임 하나만 존재한다. 이번 cycle에서 꺼낸 슬롯은
+        # 제거하므로 같은 프레임을 다음 cycle에 다시 보내지 않는다.
+        for message_type in RTCM_PASS_ORDER:
+            candidate = _latest_rtcm_frames.pop(message_type, None)
             if candidate is None:
+                missing_types.append(message_type)
                 continue
 
             age = now - candidate.published_at
             if age > RTCM_MAX_AGE_SECONDS:
-                stale_frames.append(_latest_rtcm_frames.pop(message_type))
+                stale_types.append(message_type)
                 continue
 
-            selected = _latest_rtcm_frames.pop(message_type)
-            _rtcm_round_robin_index = (order_index + 1) % len(RTCM_PASS_ORDER)
-            break
+            selected.append(candidate)
 
-    for stale in stale_frames:
-        _emit_event(
-            f"[RTCM] stale pending type={stale.message_type}, "
-            f"generation={stale.generation} discarded"
-        )
-
-    return selected, waypoint
+    return selected, waypoint, tuple(stale_types), tuple(missing_types)
 
 
 def _write_all(data: bytes) -> int:
@@ -579,41 +576,43 @@ def _write_all(data: bytes) -> int:
 
 
 def _run_downlink_cycle() -> None:
-    """RTCM과 선택적 웨이포인트를 보내고 마지막에 RX 전환을 지시한다."""
+    """타입별 최신 RTCM과 선택적 웨이포인트 뒤에 RX 전환을 지시한다."""
 
-    global _cycle_count, _pending_waypoint
+    global _cycle_count, _pending_waypoint, _awaiting_downlink_end
 
     # cycle은 터미널 로그를 보기 위한 내부 카운터일 뿐 패킷에는 포함하지 않는다.
     _cycle_count += 1
     cycle = _cycle_count
-    rtcm_frame, waypoint = _take_cycle_inputs()
+    rtcm_frames, waypoint, stale_types, missing_types = _take_cycle_inputs()
 
     packets: list[bytes] = []
     rtcm_bytes = 0
-    rtcm_type: Optional[int] = None
+    rtcm_types: list[int] = []
+    rtcm_details: list[str] = []
     waypoint_id: Optional[int] = None
 
     _emit_event(f"[CYCLE {cycle}] BEGIN")
 
-    if rtcm_frame is not None:
+    # RTCM_PASS_ORDER 순서로 반환된 모든 신선한 프레임을 같은 cycle에 넣는다.
+    # 패킷 형식은 각 프레임마다 기존 FF F4 + uint16 length + RTCM 그대로다.
+    for rtcm_frame in rtcm_frames:
         age = time.monotonic() - rtcm_frame.published_at
-        if age <= RTCM_MAX_AGE_SECONDS:
-            packets.append(_build_rtcm_packet(rtcm_frame.payload))
-            rtcm_bytes = len(rtcm_frame.payload)
-            rtcm_type = rtcm_frame.message_type
-            _emit_event(
-                f"[CYCLE {cycle}] RTCM selected: type={rtcm_type}, "
-                f"length={rtcm_bytes}, generation={rtcm_frame.generation}, "
-                f"age={age:.3f}s, policy=type-round-robin"
-            )
-        else:
-            _emit_event(
-                f"[CYCLE {cycle}] RTCM selected: none "
-                f"(stale type={rtcm_frame.message_type}, "
-                f"generation={rtcm_frame.generation}, age={age:.2f}s discarded)"
-            )
-    else:
-        _emit_event(f"[CYCLE {cycle}] RTCM selected: none")
+        packets.append(_build_rtcm_packet(rtcm_frame.payload))
+        rtcm_bytes += len(rtcm_frame.payload)
+        rtcm_types.append(rtcm_frame.message_type)
+        rtcm_details.append(
+            f"{rtcm_frame.message_type}({len(rtcm_frame.payload)}B, age={age:.2f}s)"
+        )
+
+    selected_text = ",".join(str(value) for value in rtcm_types) or "none"
+    summary_parts = [f"[CYCLE {cycle}] RTCM set: {selected_text}"]
+    if stale_types:
+        summary_parts.append("stale=" + ",".join(str(value) for value in stale_types))
+    if missing_types:
+        summary_parts.append("missing=" + ",".join(str(value) for value in missing_types))
+    _emit_event(" / ".join(summary_parts))
+    if rtcm_details:
+        _emit_event(f"[CYCLE {cycle}] RTCM detail: " + "; ".join(rtcm_details))
 
     if waypoint is not None:
         # 기존 패킷 구조 FF F2 COUNT LAT/LON...를 그대로 사용한다.
@@ -627,7 +626,11 @@ def _run_downlink_cycle() -> None:
         _emit_event(f"[CYCLE {cycle}] Waypoint: none")
 
     # TTGO는 앞의 LoRa 송신을 모두 마친 뒤 FF F5를 보고 RX 모드로 들어가야 한다.
+    # TTGO는 FF F5를 무선 A3(DOWNLINK_END)로 바꿔 송신하고 D 확인 line을 돌려준다.
     packets.append(_build_enter_rx_packet())
+
+    with _state_lock:
+        _awaiting_downlink_end = (cycle, selected_text)
 
     try:
         _write_all(b"".join(packets))
@@ -638,6 +641,10 @@ def _run_downlink_cycle() -> None:
             with _state_lock:
                 if _pending_waypoint is None:
                     _pending_waypoint = waypoint
+        with _state_lock:
+            if (_awaiting_downlink_end is not None and
+                    _awaiting_downlink_end[0] == cycle):
+                _awaiting_downlink_end = None
         _emit_event(f"[CYCLE {cycle}] serial TX failed: {exc}")
         return
 
@@ -647,17 +654,17 @@ def _run_downlink_cycle() -> None:
 
     if rtcm_bytes > 0:
         _emit_event(
-            f"[RTCM TX] cycle={cycle}, type={rtcm_type}, "
-            f"queued={rtcm_bytes} B, then enter RX"
+            f"[RTCM TX] cycle={cycle}, types={selected_text}, "
+            f"frames={len(rtcm_frames)}, queued={rtcm_bytes} B"
         )
     else:
-        _emit_event(f"[RTCM TX] cycle={cycle}, no fresh RTCM, enter RX")
+        _emit_event(f"[RTCM TX] cycle={cycle}, no fresh RTCM")
 
     if waypoint_id is not None:
         _emit_event(
             f"[WAYPOINT TX] cycle={cycle}, WP#{waypoint_id} queued to TTGO"
         )
-    _emit_event(f"[CYCLE {cycle}] END -> ENTER_RX")
+    _emit_event(f"[CYCLE {cycle}] DOWNLINK_END queued to TTGO")
 
 
 def _scheduler_worker() -> None:
@@ -748,8 +755,10 @@ def send_ttgo(id: int, signal: int, msg):
 
 # ---------------------------------------------------------------------------
 # TTGO → PC 수신 라인 해석
-# 기존 R/P ASCII 상태 보고를 유지한다. A 라인은 향후 웨이포인트 ACK용이다.
+# 기존 R/P ASCII 상태 보고를 유지한다. A 라인은 향후 웨이포인트 ACK용이고,
+# D 라인은 TTGO가 A3를 실제 송신하고 RX로 전환했다는 확인이다.
 # A,millis,waypoint_id,ok
+# D,millis,ok
 # ---------------------------------------------------------------------------
 def read_ttgo():
     """TTGO가 올린 RSSI, 드론 상태 또는 웨이포인트 ACK 한 줄을 해석한다."""
@@ -767,7 +776,7 @@ def read_ttgo():
         if not line:
             return None
 
-        if not (line.startswith("R,") or line.startswith("P,") or line.startswith("A,")):
+        if not line.startswith(("R,", "P,", "A,", "D,")):
             return None
 
         parts = line.split(",")
@@ -792,6 +801,31 @@ def read_ttgo():
                 "type": "waypoint_ack",
                 "time_ms": int(parts[1]),
                 "command_id": command_id,
+                "ok": ok,
+            }
+
+        if parts[0] == "D":
+            if len(parts) < 3:
+                return None
+            ok = int(parts[2])
+            global _awaiting_downlink_end
+            with _state_lock:
+                awaiting = _awaiting_downlink_end
+                _awaiting_downlink_end = None
+            cycle = awaiting[0] if awaiting is not None else None
+            selected_text = awaiting[1] if awaiting is not None else "unknown"
+            cycle_text = str(cycle) if cycle is not None else "?"
+            if ok:
+                _emit_event(
+                    f"[CYCLE {cycle_text}] RTCM set sent: {selected_text}"
+                )
+                _emit_event(f"[CYCLE {cycle_text}] DOWNLINK_END sent -> RX")
+            else:
+                _emit_event(f"[CYCLE {cycle_text}] DOWNLINK_END TX failed -> RX")
+            return {
+                "type": "downlink_end",
+                "time_ms": int(parts[1]),
+                "cycle": cycle,
                 "ok": ok,
             }
 
@@ -827,10 +861,10 @@ def read_ttgo():
         detected_flag = raw_bytes[n6_offset]
         person_count = raw_bytes[n6_offset + 1]
 
-        print(
-            f"RX GPS: id=0x{packet_id:02X}, seq={gps_seq}, len={gps_len}, "
-            f"lat={lat}, lon={lon}, detected={detected_flag}, count={person_count}, "
-            f"RSSI={packet_rssi}, SNR={snr:.2f}"
+        _emit_event(
+            f"[GPS RX] lat={lat:.7f}, lon={lon:.7f}, seq={gps_seq}, "
+            f"det={detected_flag}, count={person_count}, "
+            f"RSSI={packet_rssi} dBm, SNR={snr:.2f} dB"
         )
 
         return {

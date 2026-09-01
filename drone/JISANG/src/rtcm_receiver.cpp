@@ -9,8 +9,17 @@
 namespace {
 constexpr uint8_t TTGO_PACKET_SINGLE = 0xA1;
 constexpr uint8_t TTGO_PACKET_FRAGMENT = 0xA2;
+constexpr uint8_t TTGO_PACKET_DOWNLINK_END = 0xA3;
+constexpr uint8_t GROUND_STATION_ID = 0xFF;
+constexpr uint8_t WAYPOINT_MESSAGE = 0xF2;
+constexpr uint8_t MAX_WAYPOINTS = 15;
 constexpr uint8_t TTGO_SINGLE_HEADER_SIZE = 2;
 constexpr uint8_t TTGO_FRAGMENT_HEADER_SIZE = 4;
+constexpr uint8_t DRONE_PACKET_ID = 0xFE;
+constexpr uint8_t DRONE_GPS_MESSAGE = 0xF3;
+constexpr uint8_t DRONE_GPS_POSITION_COUNT = 1;
+constexpr uint8_t DRONE_GPS_PACKET_SIZE = 14;
+constexpr uint32_t GPS_RESPONSE_GUARD_MS = 30;
 constexpr uint16_t RTCM_MAX_FRAME_SIZE = 1029;
 constexpr uint16_t NMEA_LINE_SIZE = 384;
 
@@ -40,6 +49,23 @@ struct Statistics {
   uint32_t ground_filter_drops = 0;
 };
 
+struct LatestGga {
+  bool valid = false;
+  double latitude = NAN;
+  double longitude = NAN;
+  uint8_t quality = 0;
+  float differential_age = NAN;
+  uint32_t received_ms = 0;
+};
+
+struct LatestWaypointCommand {
+  bool valid = false;
+  uint8_t count = 0;
+  int32_t latitude[MAX_WAYPOINTS]{};
+  int32_t longitude[MAX_WAYPOINTS]{};
+  uint32_t received_ms = 0;
+};
+
 HardwareSerial *um982 = nullptr;
 volatile bool radio_irq_pending = false;
 ReassemblyState reassembly;
@@ -65,6 +91,30 @@ uint32_t last_forwarded_bytes = 0;
 uint32_t last_uart_drops = 0;
 char nmea_line[NMEA_LINE_SIZE]{};
 uint16_t nmea_length = 0;
+LatestGga latest_gga;
+LatestWaypointCommand latest_waypoints;
+uint8_t gps_sequence = 0;
+uint8_t latest_detected_flag = 0;
+uint8_t latest_person_count = 0;
+
+void WriteInt32LE(uint8_t *destination, int32_t value) {
+  const uint32_t raw = static_cast<uint32_t>(value);
+  destination[0] = static_cast<uint8_t>(raw & 0xFFU);
+  destination[1] = static_cast<uint8_t>((raw >> 8) & 0xFFU);
+  destination[2] = static_cast<uint8_t>((raw >> 16) & 0xFFU);
+  destination[3] = static_cast<uint8_t>((raw >> 24) & 0xFFU);
+}
+
+int32_t ReadInt32LE(const uint8_t *source) {
+  const uint32_t raw = static_cast<uint32_t>(source[0]) |
+                       (static_cast<uint32_t>(source[1]) << 8) |
+                       (static_cast<uint32_t>(source[2]) << 16) |
+                       (static_cast<uint32_t>(source[3]) << 24);
+  if (raw >= 0x80000000U) {
+    return static_cast<int32_t>(static_cast<int64_t>(raw) - 0x100000000LL);
+  }
+  return static_cast<int32_t>(raw);
+}
 
 uint32_t CRC24Q(const uint8_t *data, uint16_t length) {
   uint32_t crc = 0;
@@ -363,9 +413,94 @@ void ProcessFragmentPacket(const uint8_t *packet, uint8_t length) {
   }
 }
 
+void SendLatestGgaToGround() {
+  Serial.print("[DOWNLINK_END] received\r\n");
+
+  if (!latest_gga.valid) {
+    Serial.print("[GPS TX] skipped: no valid GGA stored\r\n");
+    rx_set();
+    Serial.print("[GPS TX] skipped -> RX\r\n");
+    return;
+  }
+
+  const int32_t latitude_i =
+      static_cast<int32_t>(llround(latest_gga.latitude * 1.0e7));
+  const int32_t longitude_i =
+      static_cast<int32_t>(llround(latest_gga.longitude * 1.0e7));
+  uint8_t packet[DRONE_GPS_PACKET_SIZE]{};
+  packet[0] = DRONE_PACKET_ID;
+  packet[1] = gps_sequence++;
+  packet[2] = DRONE_GPS_MESSAGE;
+  packet[3] = DRONE_GPS_POSITION_COUNT;
+  WriteInt32LE(packet + 4, latitude_i);
+  WriteInt32LE(packet + 8, longitude_i);
+  packet[12] = latest_detected_flag;
+  packet[13] = latest_person_count;
+
+  const uint32_t sample_age_ms =
+      static_cast<uint32_t>(millis() - latest_gga.received_ms);
+  if (isfinite(latest_gga.differential_age)) {
+    Serial.printf(
+        "[GPS TX] lat=%.8f, lon=%.8f, quality=%u, age=%.2f s, "
+        "sample_age=%lu ms, det=%u, count=%u\r\n",
+        latest_gga.latitude, latest_gga.longitude, latest_gga.quality,
+        latest_gga.differential_age,
+        static_cast<unsigned long>(sample_age_ms), latest_detected_flag,
+        latest_person_count);
+  } else {
+    Serial.printf(
+        "[GPS TX] lat=%.8f, lon=%.8f, quality=%u, age=nan, "
+        "sample_age=%lu ms, det=%u, count=%u\r\n",
+        latest_gga.latitude, latest_gga.longitude, latest_gga.quality,
+        static_cast<unsigned long>(sample_age_ms), latest_detected_flag,
+        latest_person_count);
+  }
+
+  // 지상 TTGO가 A3 TxDone 뒤 RX Continuous로 전환할 시간을 보장한다.
+  delay(GPS_RESPONSE_GUARD_MS);
+  radio_irq_pending = false;
+  const bool sent = lora_send_packet(packet, sizeof(packet));
+  radio_irq_pending = false;  // 자체 TxDone DIO0 edge를 다음 RxDone으로 오인하지 않는다.
+  rx_set();
+  Serial.printf("[GPS TX] %s -> RX\r\n", sent ? "done" : "failed");
+}
+
+void ProcessWaypointPacket(const uint8_t *packet, uint8_t length) {
+  const uint8_t count = packet[2];
+  const uint16_t expected_length = static_cast<uint16_t>(3U + count * 8U);
+  if (count == 0 || count > MAX_WAYPOINTS || length != expected_length) {
+    Serial.printf(
+        "[WAYPOINT RX] rejected: count=%u length=%u expected=%u\r\n",
+        count, length, expected_length);
+    return;
+  }
+
+  LatestWaypointCommand parsed;
+  parsed.valid = true;
+  parsed.count = count;
+  parsed.received_ms = millis();
+  for (uint8_t index = 0; index < count; ++index) {
+    const uint16_t offset = static_cast<uint16_t>(3U + index * 8U);
+    parsed.latitude[index] = ReadInt32LE(packet + offset);
+    parsed.longitude[index] = ReadInt32LE(packet + offset + 4U);
+  }
+  latest_waypoints = parsed;
+
+  Serial.printf("[WAYPOINT RX] parsed/stored count=%u length=%u\r\n",
+                count, length);
+  // MATLAB 검증 형식: W,tick,count,lat1,lon1,lat2,lon2,...
+  Serial.printf("W,%lu,%u", static_cast<unsigned long>(parsed.received_ms),
+                count);
+  for (uint8_t index = 0; index < count; ++index) {
+    Serial.printf(",%.7f,%.7f", parsed.latitude[index] / 1.0e7,
+                  parsed.longitude[index] / 1.0e7);
+  }
+  Serial.print("\r\n");
+}
+
 // 현재 지상 RTKTTGO의 실제 무선 packet에는 lora_drone의 ID_GROUND(0xFF)가
 // 실리지 않는다. 따라서 존재하지 않는 ID byte를 검사해 호환성을 깨지 않고,
-// 지상국 전용 A1/A2 marker + RTCM3 시작 형식 + 활성 fragment 문맥을 검사한다.
+// 지상국 전용 A1/A2/A3 및 FF/F2 Waypoint 형식과 fragment 문맥을 검사한다.
 // 완성 뒤에는 CRC24Q까지 다시 검사하므로 다른 용도의 LoRa packet은 UM982로
 // 절대 전달되지 않는다.
 bool IsOurGroundStationPacket(const uint8_t *packet, uint8_t length) {
@@ -375,6 +510,19 @@ bool IsOurGroundStationPacket(const uint8_t *packet, uint8_t length) {
 
   if (packet[0] == TTGO_PACKET_SINGLE) {
     return length >= 5 && packet[2] == 0xD3 && (packet[3] & 0xFCU) == 0U;
+  }
+
+  if (packet[0] == TTGO_PACKET_DOWNLINK_END) {
+    return length == 1;
+  }
+
+  if (packet[0] == GROUND_STATION_ID) {
+    if (length < 3 || packet[1] != WAYPOINT_MESSAGE) {
+      return false;
+    }
+    const uint8_t count = packet[2];
+    return count >= 1 && count <= MAX_WAYPOINTS &&
+           length == static_cast<uint16_t>(3U + count * 8U);
   }
 
   if (packet[0] != TTGO_PACKET_FRAGMENT ||
@@ -436,11 +584,16 @@ void ProcessLoRaPacket() {
     return;
   }
 
-  Serial.printf("[FILTER] PASS: ground RTCM marker=0x%02X\r\n", packet[0]);
+  Serial.printf("[FILTER] PASS: ground marker=0x%02X\r\n", packet[0]);
   if (packet[0] == TTGO_PACKET_SINGLE) {
     ProcessSinglePacket(packet, length);
   } else if (packet[0] == TTGO_PACKET_FRAGMENT) {
     ProcessFragmentPacket(packet, length);
+  } else if (packet[0] == TTGO_PACKET_DOWNLINK_END) {
+    SendLatestGgaToGround();
+  } else if (packet[0] == GROUND_STATION_ID &&
+             packet[1] == WAYPOINT_MESSAGE) {
+    ProcessWaypointPacket(packet, length);
   } else {
     ++total.unsupported_packets;
     ++interval_stats.unsupported_packets;
@@ -513,6 +666,20 @@ void HandleGGALine(char *line) {
 
   ++gga_lines;
   last_gga_ms = millis();
+
+  // UM982의 10 Hz GGA가 들어올 때마다 최신값만 덮어쓴다. A3 수신 시에는
+  // 새 문장을 기다리지 않고 이 스냅샷을 즉시 사용한다.
+  if (isfinite(latitude) && isfinite(longitude) &&
+      latitude >= -90.0 && latitude <= 90.0 &&
+      longitude >= -180.0 && longitude <= 180.0) {
+    latest_gga.valid = true;
+    latest_gga.latitude = latitude;
+    latest_gga.longitude = longitude;
+    latest_gga.quality = quality;
+    latest_gga.differential_age =
+        strcmp(diff_age, "N/A") == 0 ? NAN : strtof(diff_age, nullptr);
+    latest_gga.received_ms = last_gga_ms;
+  }
 
   // MATLAB과 VS Code가 함께 읽을 수 있는 구조화 GNSS line.
   // G,tick,utc,lat,lon,alt,quality,sats,hdop,diff_age,status
@@ -633,6 +800,11 @@ void LORARTK_Begin(HardwareSerial &um982_serial) {
   total = Statistics{};
   interval_stats = Statistics{};
   sequence_initialized = false;
+  latest_gga = LatestGga{};
+  latest_waypoints = LatestWaypointCommand{};
+  gps_sequence = 0;
+  latest_detected_flag = 0;
+  latest_person_count = 0;
 
   lora_setup();
   lora_freq();
@@ -653,7 +825,9 @@ void LORARTK_Begin(HardwareSerial &um982_serial) {
       "Explicit, CRC ON\r\n",
       lora_read(0x42));
   Serial.print("[PACKET] A1=[type,seq,RTCM], "
-               "A2=[type,seq,index,count,data]\r\n");
+               "A2=[type,seq,index,count,data], A3=DOWNLINK_END, "
+               "Waypoint=[FF,F2,count,lat/lon...], "
+               "uplink=[FE,seq,F3,1,lat,lon,det,count]\r\n");
   Serial.printf("[UART] UM982 RX=%d TX=%d, 115200 8N1; USB debug 115200\r\n",
                 UM982_RX_PIN, UM982_TX_PIN);
   Serial.printf("[GNSS] Expected GGA=%u Hz, RX buffer=8192 bytes\r\n",
@@ -661,6 +835,11 @@ void LORARTK_Begin(HardwareSerial &um982_serial) {
 }
 
 void IRAM_ATTR LORARTK_NotifyRadioInterrupt() { radio_irq_pending = true; }
+
+void LORARTK_SetDetection(uint8_t detected, uint8_t person_count) {
+  latest_detected_flag = detected ? 1U : 0U;
+  latest_person_count = person_count;
+}
 
 void LORARTK_Process() {
   ProcessUM982Input();

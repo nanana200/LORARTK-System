@@ -9,6 +9,7 @@ constexpr uint8_t WRITE_BIT = 0x80;
 constexpr uint8_t READ_BIT = 0x00;
 constexpr uint8_t MODE_SLEEP_LORA = 0x80;
 constexpr uint8_t MODE_STANDBY_LORA = 0x81;
+constexpr uint8_t MODE_TX_LORA = 0x83;
 constexpr uint8_t MODE_RX_CONTINUOUS_LORA = 0x85;
 constexpr uint8_t NO_MORE = 0xFF;
 
@@ -112,6 +113,44 @@ void rx_set() {
   lora_write(0x01, MODE_RX_CONTINUOUS_LORA);
 }
 
+bool lora_send_packet(const uint8_t *buffer, uint8_t length,
+                      uint32_t timeout_ms) {
+  if (buffer == nullptr || length == 0) {
+    return false;
+  }
+
+  lora_write(0x01, MODE_STANDBY_LORA);
+  lora_write(0x12, 0xFF);
+  lora_write(0x0D, 0x80);  // RegFifoAddrPtr = TX base
+
+  SPI.beginTransaction(radio_spi_settings);
+  digitalWrite(LORA_PIN_CS, LOW);
+  SPI.transfer(0x80);  // RegFifo write
+  for (uint16_t i = 0; i < length; ++i) {
+    SPI.transfer(buffer[i]);
+  }
+  digitalWrite(LORA_PIN_CS, HIGH);
+  SPI.endTransaction();
+
+  lora_write(0x22, length);  // RegPayloadLength
+  lora_write(0x40, 0x40);    // DIO0 = TxDone
+  lora_write(0x01, MODE_TX_LORA);
+
+  const uint32_t started_ms = millis();
+  while ((lora_read(0x12) & 0x08U) == 0U) {
+    if (static_cast<uint32_t>(millis() - started_ms) >= timeout_ms) {
+      lora_write(0x01, MODE_STANDBY_LORA);
+      lora_write(0x12, 0xFF);
+      return false;
+    }
+    yield();
+  }
+
+  lora_write(0x01, MODE_STANDBY_LORA);
+  lora_write(0x12, 0xFF);
+  return true;
+}
+
 int lora_receive_packet(uint8_t *buffer, uint8_t *length,
                         uint8_t *irq_flags) {
   if (buffer == nullptr || length == nullptr || irq_flags == nullptr) {
@@ -196,4 +235,3 @@ void lora_rtcm_debug_result(uint8_t sequence, uint16_t rtcm_type,
                 frame_length, crc_ok ? 1U : 0U, fragment_count,
                 forwarded ? 1U : 0U, status == nullptr ? "UNKNOWN" : status);
 }
-

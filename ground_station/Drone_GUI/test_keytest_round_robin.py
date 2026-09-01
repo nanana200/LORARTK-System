@@ -30,14 +30,14 @@ class FakeSerial:
         return len(chunk)
 
 
-class RtcmRoundRobinTests(unittest.TestCase):
+class RtcmSetCycleTests(unittest.TestCase):
     def setUp(self) -> None:
         keytest._latest_rtcm_frames.clear()
-        keytest._rtcm_round_robin_index = 0
         keytest._rtcm_generation = 0
         keytest._rtcm_replaced_frames = 0
         keytest._pending_waypoint = None
         keytest._cycle_count = 0
+        keytest._awaiting_downlink_end = None
         keytest._link_events.clear()
         keytest._ser = None
 
@@ -48,15 +48,18 @@ class RtcmRoundRobinTests(unittest.TestCase):
                 message_type, make_rtcm(message_type, index), now
             )
 
-        selected_types = []
-        for _ in keytest.RTCM_PASS_ORDER:
-            selected, _ = keytest._take_cycle_inputs()
-            self.assertIsNotNone(selected)
-            selected_types.append(selected.message_type)
+        selected, waypoint, stale, missing = keytest._take_cycle_inputs()
+        self.assertEqual(
+            tuple(frame.message_type for frame in selected),
+            keytest.RTCM_PASS_ORDER,
+        )
+        self.assertIsNone(waypoint)
+        self.assertEqual(stale, ())
+        self.assertEqual(missing, ())
 
-        self.assertEqual(tuple(selected_types), keytest.RTCM_PASS_ORDER)
-        selected, _ = keytest._take_cycle_inputs()
-        self.assertIsNone(selected)
+        selected, _, _, missing = keytest._take_cycle_inputs()
+        self.assertEqual(selected, [])
+        self.assertEqual(missing, keytest.RTCM_PASS_ORDER)
 
     def test_same_type_overwrites_only_its_own_slot(self) -> None:
         now = time.monotonic()
@@ -67,10 +70,8 @@ class RtcmRoundRobinTests(unittest.TestCase):
         keytest.publish_latest_rtcm_frame(1006, frame_1006, now)
         keytest.publish_latest_rtcm_frame(1004, new_1004, now)
 
-        first, _ = keytest._take_cycle_inputs()
-        second, _ = keytest._take_cycle_inputs()
-        self.assertEqual(first.payload, new_1004)
-        self.assertEqual(second.payload, frame_1006)
+        selected, _, _, _ = keytest._take_cycle_inputs()
+        self.assertEqual([frame.payload for frame in selected], [new_1004, frame_1006])
         self.assertEqual(keytest._rtcm_replaced_frames, 1)
 
     def test_disallowed_type_is_rejected(self) -> None:
@@ -86,12 +87,13 @@ class RtcmRoundRobinTests(unittest.TestCase):
         )
         keytest.publish_latest_rtcm_frame(1006, make_rtcm(1006, 6), now)
 
-        selected, _ = keytest._take_cycle_inputs()
-        self.assertEqual(selected.message_type, 1006)
+        selected, _, stale, missing = keytest._take_cycle_inputs()
+        self.assertEqual([frame.message_type for frame in selected], [1006])
+        self.assertEqual(stale, (1004,))
+        self.assertEqual(missing, (1012, 1230))
         self.assertNotIn(1004, keytest._latest_rtcm_frames)
-        self.assertIn("stale pending type=1004", "\n".join(keytest.get_link_events()))
 
-    def test_each_cycle_writes_only_one_rtcm_frame(self) -> None:
+    def test_each_cycle_writes_all_fresh_rtcm_frames(self) -> None:
         now = time.monotonic()
         frame_1004 = make_rtcm(1004, 7)
         frame_1006 = make_rtcm(1006, 8)
@@ -103,14 +105,9 @@ class RtcmRoundRobinTests(unittest.TestCase):
         keytest._run_downlink_cycle()
         self.assertEqual(
             bytes(fake.written),
-            keytest._build_rtcm_packet(frame_1004) + keytest._build_enter_rx_packet(),
-        )
-
-        fake.written.clear()
-        keytest._run_downlink_cycle()
-        self.assertEqual(
-            bytes(fake.written),
-            keytest._build_rtcm_packet(frame_1006) + keytest._build_enter_rx_packet(),
+            keytest._build_rtcm_packet(frame_1004)
+            + keytest._build_rtcm_packet(frame_1006)
+            + keytest._build_enter_rx_packet(),
         )
 
 

@@ -12,6 +12,8 @@ void lora_freq();
 void packet_set();
 void fifo_set();
 void rx_set();
+bool lora_send_packet(const uint8_t *buffer, uint8_t length,
+                      uint32_t timeout_ms = 2000);
 
 int lora_receive_packet(uint8_t *buffer, uint8_t *length,
                         uint8_t *irq_flags);
@@ -26,4 +28,3 @@ void lora_rtcm_debug_result(uint8_t sequence, uint16_t rtcm_type,
                             uint16_t frame_length, uint8_t crc_ok,
                             uint8_t fragment_count, uint8_t forwarded,
                             const char *status);
-
