@@ -23,7 +23,27 @@ GNSS 기준국 / NTRIP caster
 ```text
 pc/stmrtk2time/   NTRIP 수신, RTCM 필터링, TTGO 전송, STM32 로그 모니터
 stm32/LORARTK/    SX1276 LoRa 수신, RTCM 재조립/CRC24Q, UM982 UART 브리지
+ground_station/Drone_GUI/  GUI + KEYTEST NTRIP/TTGO 2초 송신 스케줄러
+drone/JISANG/              ESP32-S3 LoRa 수신, RTCM 재조립, UM982 브리지
 ```
+
+## 현재 GUI + ESP32 구성
+
+현재 통합 테스트 구성은 `ground_station/Drone_GUI`와 `drone/JISANG`입니다.
+
+```text
+NTRIP caster
+  -> Drone_GUI/keytest.py
+  -> RTCM 1004/1006/1012/1230 타입별 최신 프레임
+  -> 2초마다 신선한 프레임 1개 선택
+  -> TTGO A1/A2 LoRa 송신
+  -> ESP32-S3 JISANG 재조립 및 CRC24Q 검사
+  -> UM982 RTCM 입력
+  -> UM982 GGA
+  -> ESP32 USB-UART 디버그
+```
+
+GUI 실행 방법과 환경변수는 `ground_station/Drone_GUI/README.md`를 참고하세요.
 
 ## PC 프로그램 실행
 
